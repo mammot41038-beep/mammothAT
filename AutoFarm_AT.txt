@@ -1,0 +1,1999 @@
+-- ============================================================
+-- AUTO FARM AT : MADE BY TERDSAK
+-- Improved & Rift System Added
+-- ============================================================
+
+-- ============================================================
+-- SERVICES & CORE VARIABLES
+-- ============================================================
+local Players         = game:GetService("Players")
+local TweenService    = game:GetService("TweenService")
+local RunService      = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Services ที่อาจไม่รองรับบางตัว executor
+local VirtualInputManager
+pcall(function() VirtualInputManager = game:GetService("VirtualInputManager") end)
+
+local GuiService
+pcall(function() GuiService = game:GetService("GuiService") end)
+
+local Player = Players.LocalPlayer
+
+-- Safe wrappers กัน nil error ถ้า executor ไม่รองรับ service
+local function sendKeyEvent(press, key)
+    if not VirtualInputManager then return end
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(press, key, false, game)
+    end)
+end
+
+local function sendMouseClick(x, y, btn, press)
+    if not VirtualInputManager then return end
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(x or 0, y or 0, btn or 0, press, game, 1)
+    end)
+end
+
+local function setSelectedObject(obj)
+    if not GuiService then return end
+    pcall(function() GuiService.SelectedObject = obj end)
+end
+
+-- Reset _G flags ทุกครั้งที่โหลดสคริปต์ใหม่ กันค่าค้างจาก session เก่า
+_G.tweenSpeed             = 0.5
+_G.raidActive             = false
+_G.autoTraitRollEnabled   = false
+_G.igrisTweenDelay        = 1
+_G.AutoSummon             = false
+_G.autoRaidAntiAfkStarted = false
+_G.autoRaidAntiAfkRunning = false
+
+-- Cleanup connections เก่าถ้ามีค้างจาก session ก่อน
+if _G.__autoFarmConns then
+    for _, conn in ipairs(_G.__autoFarmConns) do
+        pcall(function() conn:Disconnect() end)
+    end
+end
+_G.__autoFarmConns = {}
+
+-- ============================================================
+-- CONNECTION TABLES
+-- ============================================================
+local devilFruitChildConns = {}
+local boss10MChildConns    = {}
+local riftBossChildConns   = {}
+
+local function disconnectTableConns(tbl)
+    if tbl then
+        for _, conn in ipairs(tbl) do
+            if conn and typeof(conn) == "RBXScriptConnection" then
+                conn:Disconnect()
+            end
+        end
+        table.clear(tbl)
+    end
+end
+
+local function disconnectConn(conn)
+    if conn and typeof(conn) == "RBXScriptConnection" then
+        conn:Disconnect()
+    end
+end
+
+-- ============================================================
+-- ANTI-AFK (ใช้ task.delay แทน Heartbeat เพื่อลด CPU)
+-- ============================================================
+if not _G.autoRaidAntiAfkStarted then
+    _G.autoRaidAntiAfkStarted = true
+    _G.autoRaidAntiAfkRunning = true
+    local function afkLoop()
+        while _G.autoRaidAntiAfkRunning do
+            task.wait(840) -- กระโดดทุก 14 นาที
+            pcall(function()
+                local character = Player.Character
+                local humanoid  = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.Health > 0 then
+                    humanoid.Jump = true
+                end
+            end)
+        end
+    end
+    task.spawn(afkLoop)
+end
+
+-- ============================================================
+-- TRAVEL SETUP (fire on load)
+-- ============================================================
+local Setup = false
+if not Setup then
+    pcall(function()
+        local Travel = Player.PlayerGui.HUD._Frame.Travel
+        if Travel and Travel:IsA("GuiButton") then Travel:Activate() end
+    end)
+    task.delay(2, function()
+        pcall(function()
+            local Travel = Player.PlayerGui.HUD._Frame.Travel
+            if Travel and Travel:IsA("GuiButton") then Travel:Activate() end
+        end)
+        Setup = true
+    end)
+end
+
+-- ============================================================
+-- UTILITY FUNCTIONS
+-- ============================================================
+local function safeFindChild(parent, name, useWait)
+    if not parent or not name then return nil end
+    if typeof(parent) ~= "Instance" then return nil end
+    if useWait then
+        local ok, result = pcall(function() return parent:WaitForChild(name, 5) end)
+        return ok and result or nil
+    end
+    local ok, result = pcall(function() return parent:FindFirstChild(name) end)
+    return ok and result or nil
+end
+
+local function tweenTo(hrp, targetCFrame)
+    -- ล็อค Y ให้เท่ากับ mob เพื่อไม่ให้ตัวลอย
+    local safeY = targetCFrame.Y
+    local groundedCFrame = CFrame.new(targetCFrame.X, safeY, targetCFrame.Z)
+    local info  = TweenInfo.new(_G.tweenSpeed, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(hrp, info, {CFrame = groundedCFrame})
+    tween:Play()
+    tween.Completed:Wait()
+end
+
+local function simulatePressE(times, delay)
+    times = times or 5
+    delay = delay or 0.1
+    for _ = 1, times do
+        sendKeyEvent(true, Enum.KeyCode.E)
+        task.wait(0.05)
+        sendKeyEvent(false, Enum.KeyCode.E)
+        task.wait(delay)
+    end
+end
+
+local function safeFireConnection(button)
+    if not button or typeof(button) ~= "Instance" then return false end
+    local ok = pcall(function()
+        if button:IsA("GuiButton") then
+            button:Activate()
+        end
+    end)
+    return ok
+end
+
+-- ============================================================
+-- MOB DETECTION
+-- ============================================================
+local function hasDeathHighlight(target)
+    if not target then return false end
+    local h = target:FindFirstChild("M1-Hightlight")
+    return h ~= nil and h.ClassName == "Highlight"
+end
+
+local function isMobDead(target)
+    return hasDeathHighlight(target)
+end
+
+local function getLivingMobs(mobFolder)
+    if not mobFolder or not mobFolder.Parent then return {} end
+    local ok, children = pcall(function() return mobFolder:GetChildren() end)
+    if not ok then return {} end
+    local livingMobs = {}
+    local seen = {}
+    for _, v in pairs(children) do
+        if typeof(v) == "Instance" and v:IsA("Model") and not seen[v] then
+            if  v.Name:match("^Raids%d+")
+             or v.Name:match("^BossFight%d+")
+             or v.Name:match("^Rifts%d+") then
+                local highlight = v:FindFirstChild("M1-Hightlight")
+                if not (highlight and highlight.ClassName == "Highlight") then
+                    if v:FindFirstChild("HumanoidRootPart") then
+                        seen[v] = true
+                        table.insert(livingMobs, v)
+                    end
+                end
+            end
+        end
+    end
+    return livingMobs
+end
+
+-- ============================================================
+-- FARM SINGLE MOB (igris style)
+-- ============================================================
+local igrisChildConn = nil
+
+local function farmSingleMob(target, hrp)
+    if not target or not hrp then return false end
+    if igrisChildConn then disconnectConn(igrisChildConn) igrisChildConn = nil end
+
+    local targetRootPart = safeFindChild(target, "HumanoidRootPart")
+    if not targetRootPart or isMobDead(target) then return false end
+
+    -- tween ไปยืนข้างๆ mob ครั้งเดียว ใช้ Y ของ mob เพื่อให้ยืนติดพื้น ไม่ลอย
+    local mobPos     = targetRootPart.Position
+    local targetPos  = Vector3.new(mobPos.X + 6, mobPos.Y, mobPos.Z)
+    pcall(function() tweenTo(hrp, CFrame.new(targetPos)) end)
+
+    if not target or not target.Parent then return false end
+
+    -- ยืนรอให้เกมตีเสร็จ โดยเช็ค M1-Hightlight ทุก 0.3 วิ
+    -- ใช้ ChildAdded เพื่อตื่นทันทีที่ mob ตาย ไม่ต้อง poll ถี่
+    local dead = false
+    local childConn
+    childConn = target.ChildAdded:Connect(function(child)
+        if child.Name == "M1-Hightlight" and child.ClassName == "Highlight" then
+            dead = true
+            disconnectConn(childConn)
+            childConn = nil
+        end
+    end)
+    igrisChildConn = childConn
+
+    -- fallback poll กันกรณี event miss
+    while not dead do
+        task.wait(0.3)
+        if not target or not target.Parent then
+            if childConn then disconnectConn(childConn) igrisChildConn = nil end
+            return false
+        end
+        local h = target:FindFirstChild("M1-Hightlight")
+        if h and h.ClassName == "Highlight" then dead = true end
+    end
+
+    if childConn then disconnectConn(childConn) igrisChildConn = nil end
+    return true
+end
+
+-- ============================================================
+-- SERVER FOLDER HELPER
+-- ============================================================
+local function getOurServerFolder()
+    local RaidsVisual = safeFindChild(workspace, "Raids_Visual")
+    if not RaidsVisual then return nil end
+    for _, folder in pairs(RaidsVisual:GetChildren()) do
+        if string.match(folder.Name, "Server_" .. Player.Name) then
+            return folder
+        end
+    end
+    return nil
+end
+
+local function clickScreenFiveTimes()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local size = camera.ViewportSize
+    for _ = 1, 5 do
+        sendMouseClick(size.X * 0.75, size.Y * 0.25, 0, true)
+        task.wait(0.05)
+        sendMouseClick(size.X * 0.75, size.Y * 0.25, 0, false)
+        task.wait(0.12)
+    end
+end
+
+-- ============================================================
+-- STATE FLAGS
+-- ============================================================
+local igrisEnabled        = false
+local autoBoss10MEnabled  = false
+local bossFightInProgress = false
+local igrisLoopRunning    = false
+local riftBossEnabled     = false
+local riftInProgress      = false
+local currentFarmInterrupted = false
+local riftWatcherConn     = nil
+
+-- Forward declarations
+local StatusLabel
+local TraitStatusLabel
+local selectedUnit = nil
+local autoTraitRoll
+
+-- ============================================================
+-- UI CREATION
+-- ============================================================
+local ScreenGui   = Instance.new("ScreenGui")
+local MainFrame   = Instance.new("Frame")
+local ContentFrame = Instance.new("Frame")
+local FarmFrame   = Instance.new("Frame")
+local TraitFrame  = Instance.new("Frame")
+local SummonFrame = Instance.new("Frame")
+
+ScreenGui.Name            = "AutoRaidUI"
+ScreenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+ScreenGui.ResetOnSpawn    = false
+local rootPlayerGui = safeFindChild(Player, "PlayerGui", true)
+ScreenGui.Parent = rootPlayerGui or Player:WaitForChild("PlayerGui")
+
+MainFrame.Parent          = ScreenGui
+MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+MainFrame.BorderSizePixel = 0
+MainFrame.Position        = UDim2.new(0.5, -200, 0.5, -255)
+MainFrame.Size            = UDim2.new(0, 400, 0, 480)
+MainFrame.Active          = true
+MainFrame.Draggable = true
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 10); _c.Parent = MainFrame end
+
+local TopBar = Instance.new("Frame")
+TopBar.Parent = MainFrame
+TopBar.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+TopBar.BorderSizePixel  = 0
+TopBar.Size             = UDim2.new(1, 0, 0, 40)
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 10); _c.Parent = TopBar end
+
+-- Drag handler รองรับทั้ง PC และ Android touch
+do
+    local dragging, dragStart, startPos
+    local function onInputBegan(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = MainFrame.Position
+        end
+    end
+    local function onInputChanged(input)
+        if dragging and (
+            input.UserInputType == Enum.UserInputType.MouseMovement or
+            input.UserInputType == Enum.UserInputType.Touch
+        ) then
+            local delta = input.Position - dragStart
+            MainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end
+    local function onInputEnded(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end
+    TopBar.InputBegan:Connect(onInputBegan)
+    TopBar.InputChanged:Connect(onInputChanged)
+    TopBar.InputEnded:Connect(onInputEnded)
+end
+
+local Title = Instance.new("TextLabel")
+Title.Parent = TopBar
+Title.BackgroundTransparency = 1
+Title.Position     = UDim2.new(0, 15, 0, 0)
+Title.Size         = UDim2.new(0.6, 0, 1, 0)
+Title.Font         = Enum.Font.GothamBold
+Title.Text         = "Auto Farm AT : MADE BY TERDSAK"
+Title.TextColor3   = Color3.fromRGB(255, 255, 255)
+Title.TextSize     = 18
+Title.TextXAlignment = Enum.TextXAlignment.Left
+
+local MinimizeBtn = Instance.new("TextButton")
+MinimizeBtn.Parent = TopBar
+MinimizeBtn.BackgroundColor3 = Color3.fromRGB(255, 200, 50)
+MinimizeBtn.BorderSizePixel  = 0
+MinimizeBtn.Position         = UDim2.new(1, -70, 0.5, -10)
+MinimizeBtn.Size             = UDim2.new(0, 20, 0, 20)
+MinimizeBtn.Font             = Enum.Font.GothamBold
+MinimizeBtn.Text             = "-"
+MinimizeBtn.TextColor3       = Color3.fromRGB(0, 0, 0)
+MinimizeBtn.TextSize         = 16
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 5); _c.Parent = MinimizeBtn end
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Parent = TopBar
+CloseBtn.BackgroundColor3 = Color3.fromRGB(255, 50, 50)
+CloseBtn.BorderSizePixel  = 0
+CloseBtn.Position         = UDim2.new(1, -40, 0.5, -10)
+CloseBtn.Size             = UDim2.new(0, 20, 0, 20)
+CloseBtn.Font             = Enum.Font.GothamBold
+CloseBtn.Text             = "X"
+CloseBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+CloseBtn.TextSize         = 14
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 5); _c.Parent = CloseBtn end
+
+ContentFrame.Parent               = MainFrame
+ContentFrame.BackgroundTransparency = 1
+ContentFrame.Position             = UDim2.new(0, 0, 0, 50)
+ContentFrame.Size                 = UDim2.new(1, 0, 1, -50)
+
+-- Tab Bar
+local TabBar = Instance.new("Frame")
+TabBar.Parent = ContentFrame
+TabBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+TabBar.BorderSizePixel  = 0
+TabBar.Position         = UDim2.new(0, 10, 0, 5)
+TabBar.Size             = UDim2.new(1, -20, 0, 35)
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 8); _c.Parent = TabBar end
+
+local TabFarmBtn = Instance.new("TextButton")
+TabFarmBtn.Parent = TabBar
+TabFarmBtn.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+TabFarmBtn.BorderSizePixel  = 0
+TabFarmBtn.Position         = UDim2.new(0, 5, 0, 5)
+TabFarmBtn.Size             = UDim2.new(0.31, -5, 1, -10)
+TabFarmBtn.Font             = Enum.Font.GothamBold
+TabFarmBtn.Text             = "AUTO FARM"
+TabFarmBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+TabFarmBtn.TextSize         = 12
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 6); _c.Parent = TabFarmBtn end
+
+local TabTraitBtn = Instance.new("TextButton")
+TabTraitBtn.Parent = TabBar
+TabTraitBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+TabTraitBtn.BorderSizePixel  = 0
+TabTraitBtn.Position         = UDim2.new(0.33, 5, 0, 5)
+TabTraitBtn.Size             = UDim2.new(0.31, -5, 1, -10)
+TabTraitBtn.Font             = Enum.Font.GothamBold
+TabTraitBtn.Text             = "TRAIT"
+TabTraitBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+TabTraitBtn.TextSize         = 12
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 6); _c.Parent = TabTraitBtn end
+
+local TabSummonBtn = Instance.new("TextButton")
+TabSummonBtn.Parent = TabBar
+TabSummonBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+TabSummonBtn.BorderSizePixel  = 0
+TabSummonBtn.Position         = UDim2.new(0.66, 5, 0, 5)
+TabSummonBtn.Size             = UDim2.new(0.31, -5, 1, -10)
+TabSummonBtn.Font             = Enum.Font.GothamBold
+TabSummonBtn.Text             = "SUMMON"
+TabSummonBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+TabSummonBtn.TextSize         = 12
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 6); _c.Parent = TabSummonBtn end
+
+-- Content Frames
+FarmFrame.Parent               = ContentFrame
+FarmFrame.BackgroundTransparency = 1
+FarmFrame.Position             = UDim2.new(0, 0, 0, 45)
+FarmFrame.Size                 = UDim2.new(1, 0, 1, -45)
+FarmFrame.Visible              = true
+
+TraitFrame.Parent               = ContentFrame
+TraitFrame.BackgroundTransparency = 1
+TraitFrame.Position             = UDim2.new(0, 0, 0, 45)
+TraitFrame.Size                 = UDim2.new(1, 0, 1, -45)
+TraitFrame.Visible              = false
+
+SummonFrame.Parent               = ContentFrame
+SummonFrame.BackgroundTransparency = 1
+SummonFrame.Position             = UDim2.new(0, 0, 0, 45)
+SummonFrame.Size                 = UDim2.new(1, 0, 1, -45)
+SummonFrame.Visible              = false
+
+-- Tab switching
+local function switchTab(tab)
+    FarmFrame.Visible   = (tab == "farm")
+    TraitFrame.Visible  = (tab == "trait")
+    SummonFrame.Visible = (tab == "summon")
+    TabFarmBtn.BackgroundColor3   = tab == "farm"   and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(50, 50, 50)
+    TabTraitBtn.BackgroundColor3  = tab == "trait"  and Color3.fromRGB(100, 100, 255) or Color3.fromRGB(50, 50, 50)
+    TabSummonBtn.BackgroundColor3 = tab == "summon" and Color3.fromRGB(255, 150, 50) or Color3.fromRGB(50, 50, 50)
+end
+TabFarmBtn.MouseButton1Click:Connect(function()   switchTab("farm")   end)
+TabTraitBtn.MouseButton1Click:Connect(function()  switchTab("trait")  end)
+TabSummonBtn.MouseButton1Click:Connect(function() switchTab("summon") end)
+
+-- ============================================================
+-- FARM FRAME ELEMENTS
+-- ============================================================
+local MapLabel = Instance.new("TextLabel")
+MapLabel.Parent = FarmFrame
+MapLabel.BackgroundTransparency = 1
+MapLabel.Position = UDim2.new(0, 20, 0, 5)
+MapLabel.Size     = UDim2.new(0, 100, 0, 18)
+MapLabel.Font     = Enum.Font.GothamBold
+MapLabel.Text     = "Map:"
+MapLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+MapLabel.TextSize = 14
+MapLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local MapButton = Instance.new("TextButton")
+MapButton.Parent = FarmFrame
+MapButton.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+MapButton.BorderSizePixel  = 0
+MapButton.Position         = UDim2.new(0, 20, 0, 25)
+MapButton.Size             = UDim2.new(1, -40, 0, 30)
+MapButton.Font             = Enum.Font.Gotham
+MapButton.Text             = "Select Map "
+MapButton.TextColor3       = Color3.fromRGB(200, 200, 200)
+MapButton.TextSize         = 13
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 8); _c.Parent = MapButton end
+
+local MapDropdown = Instance.new("Frame")
+MapDropdown.Parent = FarmFrame
+MapDropdown.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+MapDropdown.BorderSizePixel  = 0
+MapDropdown.Position         = UDim2.new(0, 20, 0, 57)
+MapDropdown.Size             = UDim2.new(1, -40, 0, 0)
+MapDropdown.ClipsDescendants = true
+MapDropdown.Visible          = false
+MapDropdown.ZIndex           = 10
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 8); _c.Parent = MapDropdown end
+
+local MapScrolling = Instance.new("ScrollingFrame")
+MapScrolling.Parent = MapDropdown
+MapScrolling.BackgroundTransparency = 1
+MapScrolling.Size                   = UDim2.new(1, 0, 1, 0)
+MapScrolling.ScrollBarThickness     = 4
+
+local ModeLabel = Instance.new("TextLabel")
+ModeLabel.Parent = FarmFrame
+ModeLabel.BackgroundTransparency = 1
+ModeLabel.Position = UDim2.new(0, 20, 0, 60)
+ModeLabel.Size     = UDim2.new(0, 100, 0, 18)
+ModeLabel.Font     = Enum.Font.GothamBold
+ModeLabel.Text     = "Difficulty:"
+ModeLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+ModeLabel.TextSize = 14
+ModeLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local ModeButton = Instance.new("TextButton")
+ModeButton.Parent = FarmFrame
+ModeButton.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+ModeButton.BorderSizePixel  = 0
+ModeButton.Position         = UDim2.new(0, 20, 0, 80)
+ModeButton.Size             = UDim2.new(1, -40, 0, 30)
+ModeButton.Font             = Enum.Font.Gotham
+ModeButton.Text             = "Select Difficulty "
+ModeButton.TextColor3       = Color3.fromRGB(200, 200, 200)
+ModeButton.TextSize         = 13
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 8); _c.Parent = ModeButton end
+
+local ModeDropdown = Instance.new("Frame")
+ModeDropdown.Parent = FarmFrame
+ModeDropdown.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+ModeDropdown.BorderSizePixel  = 0
+ModeDropdown.Position         = UDim2.new(0, 20, 0, 112)
+ModeDropdown.Size             = UDim2.new(1, -40, 0, 0)
+ModeDropdown.ClipsDescendants = true
+ModeDropdown.Visible          = false
+ModeDropdown.ZIndex           = 10
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 8); _c.Parent = ModeDropdown end
+
+local ModeScrolling = Instance.new("ScrollingFrame")
+ModeScrolling.Parent = ModeDropdown
+ModeScrolling.BackgroundTransparency = 1
+ModeScrolling.Size                   = UDim2.new(1, 0, 1, 0)
+ModeScrolling.ScrollBarThickness     = 4
+
+local StartButton = Instance.new("TextButton")
+StartButton.Parent = FarmFrame
+StartButton.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+StartButton.BorderSizePixel  = 0
+StartButton.Position         = UDim2.new(0, 20, 0, 120)
+StartButton.Size             = UDim2.new(1, -40, 0, 40)
+StartButton.Font             = Enum.Font.GothamBold
+StartButton.Text             = "START RAID"
+StartButton.TextColor3       = Color3.fromRGB(255, 255, 255)
+StartButton.TextSize         = 16
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 8); _c.Parent = StartButton end
+
+StatusLabel = Instance.new("TextLabel")
+StatusLabel.Parent = FarmFrame
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Position  = UDim2.new(0, 20, 0, 165)
+StatusLabel.Size      = UDim2.new(1, -40, 0, 25)
+StatusLabel.Font      = Enum.Font.Gotham
+StatusLabel.Text      = "Status: Idle"
+StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+StatusLabel.TextSize  = 11
+StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatusLabel.TextWrapped    = true
+
+-- Igris Mode Toggle
+local IgrisModeLabel = Instance.new("TextLabel")
+IgrisModeLabel.Parent = FarmFrame
+IgrisModeLabel.BackgroundTransparency = 1
+IgrisModeLabel.Position = UDim2.new(0, 20, 0, 193)
+IgrisModeLabel.Size     = UDim2.new(0, 100, 0, 18)
+IgrisModeLabel.Font     = Enum.Font.GothamBold
+IgrisModeLabel.Text     = "Igris Mode"
+IgrisModeLabel.TextColor3 = Color3.fromRGB(255, 150, 100)
+IgrisModeLabel.TextSize = 12
+IgrisModeLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local IgrisModeToggle = Instance.new("TextButton")
+IgrisModeToggle.Parent = FarmFrame
+IgrisModeToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+IgrisModeToggle.BorderSizePixel  = 0
+IgrisModeToggle.Position         = UDim2.new(0.6, 0, 0, 193)
+IgrisModeToggle.Size             = UDim2.new(0, 60, 0, 18)
+IgrisModeToggle.Font             = Enum.Font.GothamBold
+IgrisModeToggle.Text             = "OFF"
+IgrisModeToggle.TextColor3       = Color3.fromRGB(255, 255, 255)
+IgrisModeToggle.TextSize         = 11
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 4); _c.Parent = IgrisModeToggle end
+
+-- Boss 10M Toggle
+local Boss10MLabel = Instance.new("TextLabel")
+Boss10MLabel.Parent = FarmFrame
+Boss10MLabel.BackgroundTransparency = 1
+Boss10MLabel.Position = UDim2.new(0, 20, 0, 215)
+Boss10MLabel.Size     = UDim2.new(0, 120, 0, 18)
+Boss10MLabel.Font     = Enum.Font.GothamBold
+Boss10MLabel.Text     = "Auto Boss 10M"
+Boss10MLabel.TextColor3 = Color3.fromRGB(255, 100, 150)
+Boss10MLabel.TextSize = 12
+Boss10MLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local Boss10MToggle = Instance.new("TextButton")
+Boss10MToggle.Parent = FarmFrame
+Boss10MToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+Boss10MToggle.BorderSizePixel  = 0
+Boss10MToggle.Position         = UDim2.new(0.6, 0, 0, 215)
+Boss10MToggle.Size             = UDim2.new(0, 60, 0, 18)
+Boss10MToggle.Font             = Enum.Font.GothamBold
+Boss10MToggle.Text             = "OFF"
+Boss10MToggle.TextColor3       = Color3.fromRGB(255, 255, 255)
+Boss10MToggle.TextSize         = 11
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 4); _c.Parent = Boss10MToggle end
+
+-- Rift Boss Toggle
+local RiftBossLabel = Instance.new("TextLabel")
+RiftBossLabel.Parent = FarmFrame
+RiftBossLabel.BackgroundTransparency = 1
+RiftBossLabel.Position = UDim2.new(0, 20, 0, 237)
+RiftBossLabel.Size     = UDim2.new(0, 120, 0, 18)
+RiftBossLabel.Font     = Enum.Font.GothamBold
+RiftBossLabel.Text     = "Rift Boss"
+RiftBossLabel.TextColor3 = Color3.fromRGB(255, 50, 50)
+RiftBossLabel.TextSize = 12
+RiftBossLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local RiftBossToggle = Instance.new("TextButton")
+RiftBossToggle.Parent = FarmFrame
+RiftBossToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+RiftBossToggle.BorderSizePixel  = 0
+RiftBossToggle.Position         = UDim2.new(0.6, 0, 0, 237)
+RiftBossToggle.Size             = UDim2.new(0, 60, 0, 18)
+RiftBossToggle.Font             = Enum.Font.GothamBold
+RiftBossToggle.Text             = "OFF"
+RiftBossToggle.TextColor3       = Color3.fromRGB(255, 255, 255)
+RiftBossToggle.TextSize         = 11
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 4); _c.Parent = RiftBossToggle end
+
+-- Devil Fruit Toggle
+local DevilFruitLabel = Instance.new("TextLabel")
+DevilFruitLabel.Parent = FarmFrame
+DevilFruitLabel.BackgroundTransparency = 1
+DevilFruitLabel.Position = UDim2.new(0, 20, 0, 259)
+DevilFruitLabel.Size     = UDim2.new(0, 120, 0, 18)
+DevilFruitLabel.Font     = Enum.Font.GothamBold
+DevilFruitLabel.Text     = "Devil Fruit Farm"
+DevilFruitLabel.TextColor3 = Color3.fromRGB(255, 100, 255)
+DevilFruitLabel.TextSize = 12
+DevilFruitLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local DevilFruitToggle = Instance.new("TextButton")
+DevilFruitToggle.Parent = FarmFrame
+DevilFruitToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+DevilFruitToggle.BorderSizePixel  = 0
+DevilFruitToggle.Position         = UDim2.new(0.6, 0, 0, 259)
+DevilFruitToggle.Size             = UDim2.new(0, 60, 0, 18)
+DevilFruitToggle.Font             = Enum.Font.GothamBold
+DevilFruitToggle.Text             = "OFF"
+DevilFruitToggle.TextColor3       = Color3.fromRGB(255, 255, 255)
+DevilFruitToggle.TextSize         = 11
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 4); _c.Parent = DevilFruitToggle end
+
+-- Tween Speed
+local TweenSpeedLabel = Instance.new("TextLabel")
+TweenSpeedLabel.Parent = FarmFrame
+TweenSpeedLabel.BackgroundTransparency = 1
+TweenSpeedLabel.Position = UDim2.new(0, 20, 1, -40)
+TweenSpeedLabel.Size     = UDim2.new(0, 100, 0, 18)
+TweenSpeedLabel.Font     = Enum.Font.GothamBold
+TweenSpeedLabel.Text     = "Tween Speed:"
+TweenSpeedLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+TweenSpeedLabel.TextSize = 12
+TweenSpeedLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local TweenSpeedBox = Instance.new("TextBox")
+TweenSpeedBox.Parent = FarmFrame
+TweenSpeedBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+TweenSpeedBox.BorderSizePixel  = 0
+TweenSpeedBox.Position         = UDim2.new(0, 130, 1, -40)
+TweenSpeedBox.Size             = UDim2.new(0, 60, 0, 18)
+TweenSpeedBox.Font             = Enum.Font.Gotham
+TweenSpeedBox.Text             = tostring(_G.tweenSpeed)
+TweenSpeedBox.TextColor3       = Color3.fromRGB(200, 200, 200)
+TweenSpeedBox.TextSize         = 12
+TweenSpeedBox.PlaceholderText  = "Speed"
+TweenSpeedBox.ClearTextOnFocus = false
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 4); _c.Parent = TweenSpeedBox end
+
+TweenSpeedBox.FocusLost:Connect(function()
+    local val = tonumber(TweenSpeedBox.Text)
+    if val and val > 0 then
+        _G.tweenSpeed = val
+    else
+        TweenSpeedBox.Text = tostring(_G.tweenSpeed)
+    end
+end)
+
+-- ============================================================
+-- TRAIT FRAME ELEMENTS
+-- ============================================================
+local TraitRollLabel = Instance.new("TextLabel")
+TraitRollLabel.Parent = TraitFrame
+TraitRollLabel.BackgroundTransparency = 1
+TraitRollLabel.Position = UDim2.new(0, 20, 0, 10)
+TraitRollLabel.Size     = UDim2.new(0, 120, 0, 18)
+TraitRollLabel.Font     = Enum.Font.GothamBold
+TraitRollLabel.Text     = "Auto Trait Roll"
+TraitRollLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
+TraitRollLabel.TextSize = 12
+TraitRollLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local TraitRollToggle = Instance.new("TextButton")
+TraitRollToggle.Parent = TraitFrame
+TraitRollToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+TraitRollToggle.BorderSizePixel  = 0
+TraitRollToggle.Position         = UDim2.new(0.6, 0, 0, 10)
+TraitRollToggle.Size             = UDim2.new(0, 60, 0, 18)
+TraitRollToggle.Font             = Enum.Font.GothamBold
+TraitRollToggle.Text             = "OFF"
+TraitRollToggle.TextColor3       = Color3.fromRGB(255, 255, 255)
+TraitRollToggle.TextSize         = 11
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 4); _c.Parent = TraitRollToggle end
+
+local SelectedUnitLabel = Instance.new("TextLabel")
+SelectedUnitLabel.Parent = TraitFrame
+SelectedUnitLabel.BackgroundTransparency = 1
+SelectedUnitLabel.Position = UDim2.new(0, 20, 0, 35)
+SelectedUnitLabel.Size     = UDim2.new(1, -40, 0, 18)
+SelectedUnitLabel.Font     = Enum.Font.Gotham
+SelectedUnitLabel.Text     = "Unit: None"
+SelectedUnitLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+SelectedUnitLabel.TextSize = 11
+SelectedUnitLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local UnitSelectorButton = Instance.new("TextButton")
+UnitSelectorButton.Parent = TraitFrame
+UnitSelectorButton.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+UnitSelectorButton.BorderSizePixel  = 0
+UnitSelectorButton.Position         = UDim2.new(0, 20, 0, 55)
+UnitSelectorButton.Size             = UDim2.new(1, -40, 0, 28)
+UnitSelectorButton.Font             = Enum.Font.Gotham
+UnitSelectorButton.Text             = "Select Unit "
+UnitSelectorButton.TextColor3       = Color3.fromRGB(200, 200, 200)
+UnitSelectorButton.TextSize         = 13
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 8); _c.Parent = UnitSelectorButton end
+
+local UnitDropdown = Instance.new("Frame")
+UnitDropdown.Parent = TraitFrame
+UnitDropdown.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+UnitDropdown.BorderSizePixel  = 0
+UnitDropdown.Position         = UDim2.new(0, 20, 0, 85)
+UnitDropdown.Size             = UDim2.new(1, -40, 0, 0)
+UnitDropdown.ClipsDescendants = true
+UnitDropdown.Visible          = false
+UnitDropdown.ZIndex           = 10
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 8); _c.Parent = UnitDropdown end
+
+local UnitScrolling = Instance.new("ScrollingFrame")
+UnitScrolling.Parent = UnitDropdown
+UnitScrolling.BackgroundTransparency = 1
+UnitScrolling.Size                   = UDim2.new(1, 0, 1, 0)
+UnitScrolling.ScrollBarThickness     = 4
+
+TraitStatusLabel = Instance.new("TextLabel")
+TraitStatusLabel.Parent = TraitFrame
+TraitStatusLabel.BackgroundTransparency = 1
+TraitStatusLabel.Position = UDim2.new(0, 20, 0, 90)
+TraitStatusLabel.Size     = UDim2.new(1, -40, 0, 25)
+TraitStatusLabel.Font     = Enum.Font.Gotham
+TraitStatusLabel.Text     = "Trait Status: Idle"
+TraitStatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+TraitStatusLabel.TextSize = 11
+TraitStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+TraitStatusLabel.TextWrapped    = true
+
+-- ============================================================
+-- SUMMON FRAME ELEMENTS
+-- ============================================================
+local AutoSummonLabel = Instance.new("TextLabel")
+AutoSummonLabel.Parent = SummonFrame
+AutoSummonLabel.BackgroundTransparency = 1
+AutoSummonLabel.Position = UDim2.new(0, 20, 0, 10)
+AutoSummonLabel.Size     = UDim2.new(0, 150, 0, 25)
+AutoSummonLabel.Font     = Enum.Font.GothamBold
+AutoSummonLabel.Text     = "Auto Summon"
+AutoSummonLabel.TextColor3 = Color3.fromRGB(255, 200, 50)
+AutoSummonLabel.TextSize = 13
+AutoSummonLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local AutoSummonToggle = Instance.new("TextButton")
+AutoSummonToggle.Parent = SummonFrame
+AutoSummonToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+AutoSummonToggle.BorderSizePixel  = 0
+AutoSummonToggle.Position         = UDim2.new(1, -90, 0, 10)
+AutoSummonToggle.Size             = UDim2.new(0, 70, 0, 25)
+AutoSummonToggle.Font             = Enum.Font.GothamBold
+AutoSummonToggle.Text             = "OFF"
+AutoSummonToggle.TextColor3       = Color3.fromRGB(255, 255, 255)
+AutoSummonToggle.TextSize         = 12
+do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 4); _c.Parent = AutoSummonToggle end
+
+local SummonStatusLabel = Instance.new("TextLabel")
+SummonStatusLabel.Parent = SummonFrame
+SummonStatusLabel.BackgroundTransparency = 1
+SummonStatusLabel.Position = UDim2.new(0, 20, 0, 45)
+SummonStatusLabel.Size     = UDim2.new(1, -40, 0, 30)
+SummonStatusLabel.Font     = Enum.Font.Gotham
+SummonStatusLabel.Text     = "Status: Idle"
+SummonStatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+SummonStatusLabel.TextSize = 12
+SummonStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+SummonStatusLabel.TextWrapped    = true
+
+-- ============================================================
+-- MAP & MODE DATA
+-- ============================================================
+local Maps = {
+    {name = "Namex Planet",      enabled = false},
+    {name = "Colosseum Kingdom", enabled = false},
+    {name = "Demon Forest",      enabled = false},
+    {name = "Dungeons Town",     enabled = false},
+    {name = "Reaper Society",    enabled = false},
+}
+local Modes = {
+    {name = "Easy",      enabled = false},
+    {name = "Medium",    enabled = false},
+    {name = "Hard",      enabled = false},
+    {name = "Nightmare", enabled = false},
+}
+
+local function createMapButton(map, index)
+    local btn = Instance.new("TextButton")
+btn.Parent = MapScrolling
+    btn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    btn.BorderSizePixel  = 0
+    btn.Position         = UDim2.new(0, 5, 0, (index - 1) * 32)
+    btn.Size             = UDim2.new(1, -10, 0, 28)
+    btn.Font             = Enum.Font.Gotham
+    btn.Text             = map.name
+    btn.TextColor3       = Color3.fromRGB(200, 200, 200)
+    btn.TextSize         = 12
+    do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 6); _c.Parent = btn end
+    btn.MouseButton1Click:Connect(function()
+        for _, m in pairs(Maps) do m.enabled = false end
+        map.enabled = true
+        MapButton.Text = map.name
+        MapDropdown:TweenSize(UDim2.new(1, -40, 0, 0), "Out", "Quad", 0.2, true, function()
+            MapDropdown.Visible = false
+        end)
+        for _, child in pairs(MapScrolling:GetChildren()) do
+            if child:IsA("TextButton") then child.BackgroundColor3 = Color3.fromRGB(50, 50, 50) end
+        end
+        btn.BackgroundColor3 = Color3.fromRGB(70, 130, 180)
+    end)
+    return btn
+end
+
+local function createModeButton(mode, index)
+    local btn = Instance.new("TextButton")
+btn.Parent = ModeScrolling
+    btn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    btn.BorderSizePixel  = 0
+    btn.Position         = UDim2.new(0, 5, 0, (index - 1) * 32)
+    btn.Size             = UDim2.new(1, -10, 0, 28)
+    btn.Font             = Enum.Font.Gotham
+    btn.Text             = mode.name
+    btn.TextColor3       = Color3.fromRGB(200, 200, 200)
+    btn.TextSize         = 12
+    do local _c = Instance.new("UICorner"); _c.CornerRadius = UDim.new(0, 6); _c.Parent = btn end
+    btn.MouseButton1Click:Connect(function()
+        for _, m in pairs(Modes) do m.enabled = false end
+        mode.enabled = true
+        ModeButton.Text = mode.name
+        ModeDropdown:TweenSize(UDim2.new(1, -40, 0, 0), "Out", "Quad", 0.2, true, function()
+            ModeDropdown.Visible = false
+        end)
+        for _, child in pairs(ModeScrolling:GetChildren()) do
+            if child:IsA("TextButton") then child.BackgroundColor3 = Color3.fromRGB(50, 50, 50) end
+        end
+        btn.BackgroundColor3 = Color3.fromRGB(70, 130, 180)
+    end)
+    return btn
+end
+
+for i, map  in ipairs(Maps)  do createMapButton(map, i)   end
+for i, mode in ipairs(Modes) do createModeButton(mode, i) end
+MapScrolling.CanvasSize  = UDim2.new(0, 0, 0, #Maps  * 32)
+ModeScrolling.CanvasSize = UDim2.new(0, 0, 0, #Modes * 32)
+
+MapButton.MouseButton1Click:Connect(function()
+    if MapDropdown.Visible then
+        MapDropdown:TweenSize(UDim2.new(1, -40, 0, 0), "Out", "Quad", 0.2, true, function() MapDropdown.Visible = false end)
+    else
+        MapDropdown.Visible = true
+        MapDropdown:TweenSize(UDim2.new(1, -40, 0, math.min(#Maps * 32 + 10, 130)), "Out", "Quad", 0.2, true)
+        if ModeDropdown.Visible then
+            ModeDropdown:TweenSize(UDim2.new(1, -40, 0, 0), "Out", "Quad", 0.2, true, function() ModeDropdown.Visible = false end)
+        end
+    end
+end)
+
+ModeButton.MouseButton1Click:Connect(function()
+    if ModeDropdown.Visible then
+        ModeDropdown:TweenSize(UDim2.new(1, -40, 0, 0), "Out", "Quad", 0.2, true, function() ModeDropdown.Visible = false end)
+    else
+        ModeDropdown.Visible = true
+        ModeDropdown:TweenSize(UDim2.new(1, -40, 0, math.min(#Modes * 32 + 10, 130)), "Out", "Quad", 0.2, true)
+        if MapDropdown.Visible then
+            MapDropdown:TweenSize(UDim2.new(1, -40, 0, 0), "Out", "Quad", 0.2, true, function() MapDropdown.Visible = false end)
+        end
+    end
+end)
+
+-- ============================================================
+-- IGRIS RAID
+-- ============================================================
+local function igrisRaid()
+    StatusLabel.Text = "Status: [IGRIS] Starting..."
+    local function shouldInterrupt()
+        -- Rift สำคัญสุด หยุด Igris ทันทีเมื่อ Rift กำลังทำงาน
+        return bossFightInProgress or riftInProgress or not igrisEnabled
+    end
+    if shouldInterrupt() then return "interrupted" end
+
+    local Character        = Player.Character or Player.CharacterAdded:Wait()
+    local HumanoidRootPart = safeFindChild(Character, "HumanoidRootPart", true)
+    if not HumanoidRootPart then
+        StatusLabel.Text = "Status: [IGRIS] Error - No HRP"
+        task.wait(1); return
+    end
+
+    StatusLabel.Text = "Status: [IGRIS] Returning Home..."
+    pcall(function()
+        local things2 = Player.PlayerGui.Travel._Frame.Usage.BODY.Useable.Interview["Dungeons Town"].Things["2"]
+        if things2 and things2:IsA("GuiButton") then
+            things2:Activate()
+            task.wait(1)
+        end
+    end)
+
+    task.wait(_G.igrisTweenDelay)
+    if shouldInterrupt() then return "interrupted" end
+
+    StatusLabel.Text = "Status: [IGRIS] Tweening to start..."
+    pcall(function()
+        tweenTo(HumanoidRootPart, CFrame.new(-3023.17041015625, 1040.30224609375, -1859.906982421875))
+    end)
+    task.wait(1.5)
+    if shouldInterrupt() then return "interrupted" end
+
+    StatusLabel.Text = "Status: [IGRIS] Starting raid..."
+    local startBtn = Player.PlayerGui.Raids._Frame.Usage.Right.Start
+    if startBtn and typeof(startBtn) == "Instance" then
+        setSelectedObject(startBtn)
+        sendKeyEvent(true, Enum.KeyCode.Return)
+        sendKeyEvent(false, Enum.KeyCode.Return)
+        task.wait(1)
+        setSelectedObject(nil)
+    end
+
+    if _G.autoTraitRollEnabled and selectedUnit then
+        TraitStatusLabel.Text = "Trait Status: Rolling..."
+        autoTraitRoll()
+    end
+    task.wait(2)
+    if shouldInterrupt() then return "interrupted" end
+
+    StatusLabel.Text = "Status: [IGRIS] Farming mobs..."
+    local worlds  = safeFindChild(workspace, "Worlds", true)
+    local targets = worlds and safeFindChild(worlds, "Targets", true)
+    local mob     = targets and safeFindChild(targets, "Clients", true)
+    if not mob then
+        StatusLabel.Text = "Status: [IGRIS] Targets not found"
+        return
+    end
+
+    -- Warmup wait
+    local warmupDeadline = tick() + 6
+    local hasSeenAnyMob  = false
+    while tick() < warmupDeadline and igrisEnabled do
+        if shouldInterrupt() then return "interrupted" end
+        if #getLivingMobs(mob) > 0 then hasSeenAnyMob = true break end
+        task.wait(0.35)
+    end
+    if not hasSeenAnyMob then StatusLabel.Text = "Status: [IGRIS] Waiting mobs spawn..." end
+
+    -- Farm loop
+    local farmingComplete = false
+    while not farmingComplete and igrisEnabled do
+        if shouldInterrupt() then return "interrupted" end
+        if not mob or not mob.Parent then farmingComplete = true break end
+        local char = Player.Character or Player.CharacterAdded:Wait()
+        local hrp  = safeFindChild(char, "HumanoidRootPart", true)
+        if not hrp then break end
+        local livingMobs = getLivingMobs(mob)
+        if #livingMobs > 0 then
+            local foundAlive = false
+            for _, candidate in ipairs(livingMobs) do
+                if not isMobDead(candidate) then
+                    farmSingleMob(candidate, hrp)
+                    if isMobDead(candidate) then
+                        foundAlive = false; break
+                    else
+                        foundAlive = true
+                    end
+                end
+            end
+            if not foundAlive then farmingComplete = true end
+        else
+            farmingComplete = true
+        end
+    end
+
+    -- Verify clear
+    local clearChecks    = 0
+    local waveWaitElapsed = 0
+    while clearChecks < 1 and igrisEnabled do
+        if shouldInterrupt() then return "interrupted" end
+        local verifyMobs = getLivingMobs(mob)
+        if #verifyMobs > 0 then
+            clearChecks = 0
+            local verifyChar = Player.Character or Player.CharacterAdded:Wait()
+            local verifyHrp  = safeFindChild(verifyChar, "HumanoidRootPart", true)
+            if verifyHrp then farmSingleMob(verifyMobs[1], verifyHrp) else task.wait(0.2) end
+            waveWaitElapsed = 0
+        else
+            if waveWaitElapsed < 2 then
+                task.wait(0.5); waveWaitElapsed = waveWaitElapsed + 0.5
+            else
+                clearChecks = clearChecks + 1
+            end
+        end
+    end
+
+    if shouldInterrupt() then return "interrupted" end
+
+    -- Collect rewards
+    StatusLabel.Text = "Status: [IGRIS] Collecting rewards..."
+    local char = Player.Character or Player.CharacterAdded:Wait()
+    HumanoidRootPart = safeFindChild(char, "HumanoidRootPart", true)
+    local serverFolder = getOurServerFolder()
+    if serverFolder then
+        local configs  = safeFindChild(serverFolder, "Configs")
+        local others   = configs and safeFindChild(configs, "Others")
+        local rewards  = others and safeFindChild(others, "Rewards")
+        local golds    = rewards and safeFindChild(rewards, "Golds")
+        local primary  = golds and safeFindChild(golds, "Primary")
+        local portal   = others and safeFindChild(others, "Portal")
+        local travel   = portal and safeFindChild(portal, "Travel")
+
+        if primary and primary:IsA("BasePart") and HumanoidRootPart then
+            if shouldInterrupt() then return "interrupted" end
+            tweenTo(HumanoidRootPart, CFrame.new(primary.Position + Vector3.new(0, 10, 0)))
+            task.wait(1)
+            for _ = 1, 10 do
+                task.wait(0.1)
+                sendKeyEvent(true, Enum.KeyCode.E)
+                sendKeyEvent(false, Enum.KeyCode.E)
+            end
+        end
+
+        if travel and travel:IsA("BasePart") and HumanoidRootPart then
+            if shouldInterrupt() then return "interrupted" end
+            local exit = travel.Position
+            HumanoidRootPart.CFrame = CFrame.new(exit.X, exit.Y + 5, exit.Z)
+            task.wait(1)
+            for _ = 1, 10 do
+                task.wait(0.1)
+                sendKeyEvent(true, Enum.KeyCode.E)
+                sendKeyEvent(false, Enum.KeyCode.E)
+            end
+        end
+    end
+
+    StatusLabel.Text = "Status: [IGRIS] Complete!"
+    if shouldInterrupt() then return "interrupted" end
+    pcall(clickScreenFiveTimes)
+    return "completed"
+end
+
+local function igrisRaidLoop()
+    if igrisLoopRunning then return end
+    igrisLoopRunning = true
+    while igrisEnabled do
+        -- รอถ้า Rift หรือ Boss 10M กำลังทำงาน (Rift สำคัญสุด)
+        if riftInProgress or bossFightInProgress then
+            if riftInProgress then
+                StatusLabel.Text = "Status: [IGRIS] Paused - Rift in progress..."
+            else
+                StatusLabel.Text = "Status: [IGRIS] Waiting for Boss 10M..."
+            end
+            while (riftInProgress or bossFightInProgress) and igrisEnabled do
+                task.wait(1)
+            end
+            if not igrisEnabled then break end
+        end
+        if igrisEnabled then
+            local result = igrisRaid()
+            if result == "interrupted" then
+                while (riftInProgress or bossFightInProgress) and igrisEnabled do
+                    task.wait(1)
+                end
+                if not igrisEnabled then break end
+                continue
+            end
+            if _G.autoTraitRollEnabled and selectedUnit then
+                TraitStatusLabel.Text = "Trait Status: Rolling..."
+                autoTraitRoll()
+            end
+        end
+        if not igrisEnabled then break end
+        if riftInProgress or bossFightInProgress then continue end
+        task.wait(0.5)
+    end
+    igrisLoopRunning = false
+    StatusLabel.Text  = "Status: Idle"
+end
+
+-- ============================================================
+-- BOSS 10M
+-- ============================================================
+local function setupBoss10MHandler()
+    disconnectTableConns(boss10MChildConns)
+    local Clients = workspace:FindFirstChild("Worlds")
+        and workspace.Worlds:FindFirstChild("Targets")
+        and workspace.Worlds.Targets:FindFirstChild("Clients")
+    if not Clients then return end
+
+    local function warpToKokushibo()
+        if not autoBoss10MEnabled or riftInProgress then return end
+        local kokushibo    = Clients:FindFirstChild("Kokushibo")
+        if not kokushibo then return end
+        local hrp          = safeFindChild(Player.Character, "HumanoidRootPart", true)
+        local kokushiboHRP = kokushibo:FindFirstChild("HumanoidRootPart")
+        if hrp and kokushiboHRP then
+            pcall(function() tweenTo(hrp, kokushiboHRP.CFrame + Vector3.new(6, 0, 0)) end)
+        end
+    end
+
+    local function warpToBoss(bossModel)
+        if not autoBoss10MEnabled or riftInProgress then return end
+        local BossEnter  = workspace:FindFirstChild("BossFight_Entering")
+        local enterPart  = BossEnter and BossEnter:FindFirstChild("Demon Forest")
+        local hrp        = safeFindChild(Player.Character, "HumanoidRootPart", true)
+        local targetRoot = bossModel:FindFirstChild("HumanoidRootPart")
+        if not (hrp and targetRoot and enterPart) then return end
+
+        -- รอถ้า Rift กำลังทำงาน
+        while riftInProgress do task.wait(1) end
+        if not autoBoss10MEnabled then return end
+
+        hrp.CFrame = enterPart.CFrame
+        task.wait(5)
+        if not autoBoss10MEnabled or riftInProgress then return end
+
+        pcall(function() tweenTo(hrp, targetRoot.CFrame + Vector3.new(6, 0, 0)) end)
+
+        while autoBoss10MEnabled do
+            -- หยุดทันทีถ้า Rift spawn
+            if riftInProgress then return end
+            task.wait(0.3)
+            if not bossModel or not bossModel.Parent then return end
+            local h = bossModel:FindFirstChild("M1-Hightlight")
+            if h and h.ClassName == "Highlight" then
+                task.wait(0.5)
+                if not riftInProgress then warpToKokushibo() end
+                return
+            end
+        end
+
+        local diedConn
+        diedConn = bossModel.ChildAdded:Connect(function(c)
+            if c.Name == "M1-Hightlight" and c.ClassName == "Highlight" then
+                task.wait(0.5)
+                diedConn:Disconnect()
+                for _ = 1, 30 do
+                    if not autoBoss10MEnabled then return end
+                    task.wait(0.1)
+                    for _, mob in pairs(Clients:GetChildren()) do
+                        if mob.ClassName == "Model" and mob.Name:match("^BossFight") then
+                            local mobRoot = mob:FindFirstChild("HumanoidRootPart")
+                            local playerHrp = safeFindChild(Player.Character, "HumanoidRootPart", true)
+                            if playerHrp and mobRoot then
+                                pcall(function() tweenTo(playerHrp, mobRoot.CFrame + Vector3.new(6, 0, 0)) end)
+                                task.wait(0.5)
+                                local newH = mob:FindFirstChild("M1-Hightlight")
+                                if newH and newH.ClassName == "Highlight" then warpToKokushibo() end
+                            end
+                            return
+                        end
+                    end
+                end
+                warpToKokushibo()
+            end
+        end)
+        table.insert(boss10MChildConns, diedConn)
+    end
+
+    for _, mob in pairs(Clients:GetChildren()) do
+        if mob.ClassName == "Model" and mob.Name:match("^BossFight") then
+            warpToBoss(mob); break
+        end
+    end
+
+    local conn = Clients.ChildAdded:Connect(function(child)
+        -- เช็ค autoBoss10MEnabled ก่อนทำอะไรทุกครั้ง
+        if not autoBoss10MEnabled then return end
+        if child.ClassName == "Model" and child.Name:match("^BossFight") then
+            task.spawn(function()
+                -- เช็คซ้ำหลัง spawn กันกรณี toggle ถูกปิดระหว่างรอ
+                if not autoBoss10MEnabled then return end
+                warpToBoss(child)
+            end)
+        end
+    end)
+    table.insert(boss10MChildConns, conn)
+    table.insert(_G.__autoFarmConns, conn) -- register ไว้ cleanup รอบต่อไป
+end
+
+-- ============================================================
+-- DEVIL FRUIT FARM
+-- ============================================================
+local devilFruitEnabled    = false
+local devilFruitLoopRunning = false
+
+local function warpColosseum()
+    pcall(function()
+        local tp = Player.PlayerGui.Travel._Frame.Usage.BODY.Useable.Interview["Colosseum Kingdom"].Regular.Teleport
+        if tp and tp:IsA("GuiButton") then tp:Activate() end
+    end)
+end
+
+local function getColosseumLivingMobs(mobFolder)
+    if not mobFolder or not mobFolder.Parent then return {} end
+    local ok, children = pcall(function() return mobFolder:GetChildren() end)
+    if not ok then return {} end
+    local livingMobs = {}
+    for _, v in pairs(children) do
+        if typeof(v) == "Instance" and v:IsA("Model") and v.Name:match("^Colosseum_%d+") then
+            local h = v:FindFirstChild("M1-Hightlight")
+            if not (h and h.ClassName == "Highlight") and v:FindFirstChild("HumanoidRootPart") then
+                table.insert(livingMobs, v)
+            end
+        end
+    end
+    return livingMobs
+end
+
+local function getMaxColosseumMob(mobFolder)
+    local mobs = getColosseumLivingMobs(mobFolder)
+    local maxNum, maxMob = -1, nil
+    for _, mob in ipairs(mobs) do
+        local num = tonumber(mob.Name:match("Colosseum_(%d+)$"))
+        if num and num > maxNum then maxNum = num maxMob = mob end
+    end
+    return maxMob
+end
+
+local function devilFruitFarmLoop()
+    if devilFruitLoopRunning then return end
+    devilFruitLoopRunning = true
+    warpColosseum()
+    task.wait(2)
+
+    local summoners = workspace:FindFirstChild("Summoners")
+    _G.colosseumBackup = {}
+    if summoners then
+        for i = 1, 2 do
+            local col = summoners:FindFirstChild("Colosseum Kingdom")
+            if col then _G.colosseumBackup[i] = col:Clone() col:Destroy() end
+        end
+    end
+
+    StatusLabel.Text = "Status: [DevilFruit] Searching mob..."
+    local heartbeatConn
+    heartbeatConn = RunService.Heartbeat:Connect(function()
+        if not devilFruitEnabled or bossFightInProgress then
+            heartbeatConn:Disconnect()
+            devilFruitLoopRunning = false
+            StatusLabel.Text = "Status: Idle"
+            return
+        end
+        local char = Player.Character or Player.CharacterAdded:Wait()
+        local hrp  = safeFindChild(char, "HumanoidRootPart", true)
+        if not hrp then return end
+        local targets = workspace:FindFirstChild("Worlds")
+            and workspace.Worlds:FindFirstChild("Targets")
+            and workspace.Worlds.Targets:FindFirstChild("Clients")
+        local mob = getMaxColosseumMob(targets)
+        if mob and mob.Parent and not isMobDead(mob) then
+            StatusLabel.Text = "Status: [DevilFruit] Farming " .. mob.Name
+            farmSingleMob(mob, hrp)
+        else
+            StatusLabel.Text = "Status: [DevilFruit] No mob found"
+        end
+    end)
+    devilFruitLoopRunning = false
+end
+
+-- ============================================================
+-- RIFT BOSS SYSTEM
+-- ============================================================
+local REAPER_MOB_NAME = "Reaper_56"
+
+local function teleportToReaperSociety()
+    StatusLabel.Text = "Status: [Rift] Teleporting to Reaper Society..."
+    local ok, err = pcall(function()
+        local payload
+        if type(buffer) == "table" and type(buffer.fromstring) == "function" then
+            payload = buffer.fromstring("\005\014\000Reaper Society\004\014\000Reaper Society")
+        else
+            -- fallback สำหรับ executor ที่ไม่รองรับ buffer
+            payload = "\005\014\000Reaper Society\004\014\000Reaper Society"
+        end
+        ReplicatedStorage
+            :WaitForChild("ByteNetReliable")
+            :FireServer(payload)
+    end)
+    if not ok then
+        StatusLabel.Text = "Status: [Rift] ❌ Teleport ล้มเหลว: " .. tostring(err)
+        return false
+    end
+    -- รอแมพโหลด
+    local waited = 0
+    repeat
+        task.wait(0.5); waited = waited + 0.5
+    until (workspace:FindFirstChild("Maps") and workspace.Maps:FindFirstChild("Reaper Society"))
+       or waited >= 10
+    if waited >= 10 then
+        StatusLabel.Text = "Status: [Rift] ❌ แมพโหลดไม่ขึ้น timeout"
+        return false
+    end
+    StatusLabel.Text = "Status: [Rift] ✅ เข้า Reaper Society แล้ว"
+    return true
+end
+
+local function getRiftTargetCFrame(riftModel)
+    if not riftModel or not riftModel.Parent then return nil end
+    local modelNode = riftModel:FindFirstChild("Model")
+    if modelNode then
+        if modelNode:IsA("BasePart") then return modelNode.CFrame end
+        if modelNode:IsA("Model") then
+            local pp = modelNode.PrimaryPart or modelNode:FindFirstChildWhichIsA("BasePart", true)
+            if pp then return pp.CFrame end
+        end
+    end
+    local dp = riftModel.PrimaryPart or riftModel:FindFirstChildWhichIsA("BasePart", true)
+    return dp and dp.CFrame or nil
+end
+
+local function warpToRiftPortal(riftModel, sourceTag)
+    if not riftBossEnabled then return end
+    local character = Player.Character or Player.CharacterAdded:Wait()
+    local hrp       = safeFindChild(character, "HumanoidRootPart", true)
+
+    -- รอหา CFrame ของ portal
+    local targetCFrame
+    for _ = 1, 20 do
+        if not riftModel.Parent then return end
+        targetCFrame = getRiftTargetCFrame(riftModel)
+        if targetCFrame then break end
+        task.wait(0.1)
+    end
+    if not hrp or not targetCFrame then return end
+
+    -- ต้องใช้ Y จริงของ portal + offset เพื่อให้อยู่ในระยะ trigger E
+    -- ไม่ใช้ tweenTo wrapper เพราะมันล็อค Y ตาม ground ทำให้พลาด trigger
+    local portalPos     = targetCFrame.Position
+    local desiredCFrame = CFrame.new(portalPos.X, portalPos.Y + 3, portalPos.Z)
+    local beforeDist    = (hrp.Position - desiredCFrame.Position).Magnitude
+
+    local ok = pcall(function()
+        local info  = TweenInfo.new(_G.tweenSpeed, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+        local tween = TweenService:Create(hrp, info, {CFrame = desiredCFrame})
+        tween:Play()
+        tween.Completed:Wait()
+    end)
+
+    -- fallback ถ้า tween ไม่ถึง
+    if not ok or (hrp.Position - desiredCFrame.Position).Magnitude > math.max(8, beforeDist - 2) then
+        pcall(function() hrp.CFrame = desiredCFrame end)
+    end
+
+    task.wait(2)
+    simulatePressE(5, 0.1) -- กด E เข้า portal แบบปกติ เหมือนกดด้วยมือ
+end
+
+local function riftBossFarm()
+    local clients = workspace:FindFirstChild("Worlds")
+        and workspace.Worlds:FindFirstChild("Targets")
+        and workspace.Worlds.Targets:FindFirstChild("Clients")
+    if not clients then
+        StatusLabel.Text = "Status: [Rift] ❌ ไม่พบ Clients"
+        return
+    end
+
+    local function isRiftMob(mob)
+        return mob.ClassName == "Model" and mob.Name:match("^Rifts") ~= nil
+    end
+    local function isRiftMobAlive(mob)
+        local ok, alive = pcall(function()
+            local hrp = mob:FindFirstChild("HumanoidRootPart")
+            local hum = mob:FindFirstChild("Humanoid")
+            return hrp ~= nil and hum ~= nil and hum.Health > 0
+        end)
+        return ok and alive
+    end
+
+    StatusLabel.Text = "Status: [Rift] Farming Rift mobs..."
+
+    while riftBossEnabled do
+        -- หา mob ที่ยังมีชีวิต
+        local nextMob = nil
+        for _, mob in pairs(clients:GetChildren()) do
+            if isRiftMob(mob) and isRiftMobAlive(mob) then
+                nextMob = mob; break
+            end
+        end
+        if not nextMob then
+            StatusLabel.Text = "Status: [Rift] ✅ Rift mobs cleared!"
+            break
+        end
+
+        local hrp    = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        local mobHRP = nextMob:FindFirstChild("HumanoidRootPart")
+        if not mobHRP or not mobHRP.Parent then task.wait(0.5) continue end
+
+        -- tween ไปยืนติด mob ครั้งเดียว แล้วรอเกมตีเสร็จ
+        local mobPos = mobHRP.Position
+        pcall(function()
+            tweenTo(hrp, CFrame.new(mobPos.X + 6, mobPos.Y, mobPos.Z))
+        end)
+
+        -- รอ mob ตาย โดยเช็คทุก 0.3 วิ
+        while riftBossEnabled and isRiftMobAlive(nextMob) do
+            if not nextMob.Parent then break end
+            task.wait(0.3)
+        end
+
+        task.wait(0.2) -- buffer เล็กน้อยก่อนหาตัวต่อไป
+    end
+
+    -- ปิด UI รางวัลเหมือน Igris
+    task.wait(0.5)
+    pcall(clickScreenFiveTimes)
+end
+
+local function farmReaperBossWhileWaiting()
+    StatusLabel.Text = "Status: [Rift] Standing near Reaper_56 while waiting Rift..."
+    local maps      = workspace:FindFirstChild("Maps")
+    local reaperMap = maps and maps:FindFirstChild("Reaper Society")
+    if not reaperMap then
+        StatusLabel.Text = "Status: [Rift] ❌ Reaper Society ไม่โหลด"
+        return
+    end
+    local spawnedRifts = reaperMap:FindFirstChild("SpawnedRifts")
+
+    -- tween ไปยืนติด Reaper_56 ครั้งแรกก่อน
+    local function tweenToReaper()
+        local clients  = workspace:FindFirstChild("Worlds")
+            and workspace.Worlds:FindFirstChild("Targets")
+            and workspace.Worlds.Targets:FindFirstChild("Clients")
+        if not clients then return end
+        local reaperMob = clients:FindFirstChild(REAPER_MOB_NAME)
+        if not reaperMob then return end
+        local mobHRP = reaperMob:FindFirstChild("HumanoidRootPart")
+        if not mobHRP then return end
+        local hrp = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        pcall(function()
+            tweenTo(hrp, mobHRP.CFrame + Vector3.new(6, 0, 0))
+        end)
+    end
+
+    tweenToReaper()
+
+    -- รอ Rift spawn โดยเช็ค SpawnedRifts ทุก 1 วินาที ไม่ต้องทำอะไรเพิ่ม
+    while riftBossEnabled and not riftInProgress do
+        if spawnedRifts then
+            for _, child in pairs(spawnedRifts:GetChildren()) do
+                if child.ClassName == "Model" and child.Name == "RiftModel" then
+                    StatusLabel.Text = "Status: [Rift] 🔴 Rift spawn!"
+                    return
+                end
+            end
+        end
+        task.wait(1)
+    end
+end
+
+local stopRiftWatcher  -- forward declare
+local startRiftWatcher -- forward declare
+
+local function handleRiftSpawn(riftModel)
+    if riftInProgress then return end
+
+    -- หยุด Igris และ Boss 10M ทันที
+    riftInProgress         = true
+    currentFarmInterrupted = true
+    StatusLabel.Text = "Status: [Rift] 🔴 Rift spawn! รอ Igris/Boss หยุดก่อน..."
+
+    -- รอ Igris หยุดก่อน สูงสุด 5 วิ
+    local waitStop = 0
+    while igrisLoopRunning and waitStop < 5 do
+        task.wait(0.5); waitStop = waitStop + 0.5
+    end
+
+    -- วาร์ปไปที่ portal
+    StatusLabel.Text = "Status: [Rift] วาร์ปไป portal..."
+    warpToRiftPortal(riftModel, "watcher")
+    -- warpToRiftPortal กด E ให้แล้วและรอ 2 วิ
+
+    -- ยืนนิ่งรอ countdown ของเกม → เกมจะ teleport เราเข้าดันเจี้ยนเอง
+    -- สัญญาณว่าเข้าดันเจี้ยนแล้วคือ mob "^Rifts" spawn ใน Clients
+    StatusLabel.Text = "Status: [Rift] ⏳ รอ countdown เข้าดันเจี้ยน..."
+
+    local clients = workspace:FindFirstChild("Worlds")
+        and workspace.Worlds:FindFirstChild("Targets")
+        and workspace.Worlds.Targets:FindFirstChild("Clients")
+
+    if not clients then
+        StatusLabel.Text = "Status: [Rift] ❌ ไม่พบ Clients"
+        riftInProgress         = false
+        currentFarmInterrupted = false
+        return
+    end
+
+    -- รอ mob spawn (= เกม teleport เราเข้าแล้ว) สูงสุด 60 วิ
+    local mobArrived = false
+    local mobConn
+    mobConn = clients.ChildAdded:Connect(function(mob)
+        if mob.ClassName == "Model" and mob.Name:match("^Rifts") and not mobArrived then
+            mobArrived = true
+            pcall(function() mobConn:Disconnect() end)
+        end
+    end)
+
+    local waited = 0
+    while not mobArrived and waited < 60 do
+        -- เช็คซ้ำกันกรณี mob spawn ก่อน connect
+        local existing = clients:FindFirstChild("Rifts", true)
+            or (function()
+                for _, v in pairs(clients:GetChildren()) do
+                    if v.ClassName == "Model" and v.Name:match("^Rifts") then return v end
+                end
+            end)()
+        if existing then mobArrived = true break end
+        task.wait(0.5); waited = waited + 0.5
+    end
+
+    pcall(function() mobConn:Disconnect() end)
+
+    if not mobArrived then
+        StatusLabel.Text = "Status: [Rift] ⚠️ Timeout รอเข้าดันเจี้ยน"
+        riftInProgress         = false
+        currentFarmInterrupted = false
+        return
+    end
+
+    -- เข้าดันเจี้ยนแล้ว รอ 1 วิให้ mob โหลดครบก่อนฟาร์ม
+    task.wait(1)
+    StatusLabel.Text = "Status: [Rift] ✅ เข้าดันเจี้ยนแล้ว เริ่มฟาร์ม..."
+
+    -- ฟาร์ม mob ทั้งหมดใน Rift (รอเสร็จก่อนออก)
+    riftBossFarm()
+
+    -- ออกจาก Rift เสร็จแล้ว รีเซ็ต flag
+    task.wait(2)
+    riftInProgress         = false
+    currentFarmInterrupted = false
+
+    -- วนกลับ Reaper Society รอ Rift รอบต่อไป
+    if riftBossEnabled then
+        task.spawn(function()
+            local ok = teleportToReaperSociety()
+            if not ok then return end
+            task.wait(1)
+            stopRiftWatcher()
+            startRiftWatcher()
+            farmReaperBossWhileWaiting()
+        end)
+    end
+end
+
+startRiftWatcher = function()
+    if riftWatcherConn then return end
+    local maps       = workspace:FindFirstChild("Maps")
+    local reaperMap  = maps and maps:FindFirstChild("Reaper Society")
+    local spawnedRifts = reaperMap and reaperMap:FindFirstChild("SpawnedRifts")
+    if not spawnedRifts then
+        StatusLabel.Text = "Status: [Rift] ❌ ไม่พบ SpawnedRifts"
+        return
+    end
+    -- เช็คว่ามี RiftModel อยู่แล้วตอนเปิด
+    for _, child in pairs(spawnedRifts:GetChildren()) do
+        if child.ClassName == "Model" and child.Name == "RiftModel" then
+            task.spawn(handleRiftSpawn, child)
+            return
+        end
+    end
+    -- ฟัง RiftModel ใหม่
+    riftWatcherConn = spawnedRifts.ChildAdded:Connect(function(child)
+        if child.ClassName == "Model" and child.Name == "RiftModel" then
+            task.spawn(handleRiftSpawn, child)
+        end
+    end)
+end
+
+stopRiftWatcher = function()
+    if riftWatcherConn then
+        riftWatcherConn:Disconnect()
+        riftWatcherConn = nil
+    end
+end
+
+-- ============================================================
+-- COLLECT RAID REWARDS
+-- ============================================================
+local function collectRaidRewards()
+    StatusLabel.Text = "Status: Collecting rewards..."
+    local raidsVisual = workspace:FindFirstChild("Raids_Visual")
+    if not raidsVisual then return end
+    local server = nil
+    for _, child in ipairs(raidsVisual:GetChildren()) do
+        if child:IsA("Folder") and string.find(child.Name, "Server_" .. Player.Name) then
+            server = child; break
+        end
+    end
+    if not server then return end
+
+    local configs  = server:FindFirstChild("Configs")
+    local others   = configs and configs:FindFirstChild("Others")
+    local rewards  = others and others:FindFirstChild("Rewards")
+    local golds    = rewards and rewards:FindFirstChild("Golds")
+    local Portal   = others and others:FindFirstChild("Portal")
+    local goldPrimary = golds and golds:FindFirstChild("Primary")
+
+    if goldPrimary and goldPrimary.ClassName == "Part" then
+        local hrp = safeFindChild(Player.Character, "HumanoidRootPart", true)
+        if hrp then
+            tweenTo(hrp, goldPrimary.CFrame); task.wait(1)
+            sendKeyEvent(true, Enum.KeyCode.E)
+            sendKeyEvent(false, Enum.KeyCode.E)
+            task.wait(0.5)
+        end
+    end
+
+    local special        = rewards and rewards:FindFirstChild("Special")
+    local specialPrimary = special and special:FindFirstChild("Primary")
+    if specialPrimary and specialPrimary.ClassName == "Part" then
+        local hrp = safeFindChild(Player.Character, "HumanoidRootPart", true)
+        if hrp then
+            tweenTo(hrp, specialPrimary.CFrame); task.wait(1)
+            sendKeyEvent(true, Enum.KeyCode.E)
+            sendKeyEvent(false, Enum.KeyCode.E)
+            task.wait(0.5)
+        end
+    end
+
+    local PortalPart = Portal and Portal:FindFirstChild("Travel")
+    if PortalPart and PortalPart.ClassName == "Part" then
+        local hrp = safeFindChild(Player.Character, "HumanoidRootPart", true)
+        if hrp then
+            tweenTo(hrp, PortalPart.CFrame); task.wait(1)
+            sendKeyEvent(true, Enum.KeyCode.E)
+            sendKeyEvent(false, Enum.KeyCode.E)
+            task.wait(0.5)
+        end
+    end
+
+    task.wait(1)
+    for _ = 1, 5 do
+        sendMouseClick(0, 0, 0, true)
+        task.wait(0.2)
+        sendMouseClick(0, 0, 0, false)
+        task.wait(0.2)
+    end
+end
+
+-- ============================================================
+-- RAID STEPS
+-- ============================================================
+local startRaidStep1, startRaidStep2, startRaidStep3, startRaidStep4
+local function runFarmSequence()
+    if igrisEnabled then
+        igrisRaidLoop(); return
+    end
+    if _G.raidActive then
+        StatusLabel.Text = "Status: Starting Raid..."
+        startRaidStep1()
+    end
+end
+
+startRaidStep1 = function()
+    local Character        = Player.Character or Player.CharacterAdded:Wait()
+    local HumanoidRootPart = safeFindChild(Character, "HumanoidRootPart", true)
+    if not HumanoidRootPart then task.wait(0.2) runFarmSequence() return end
+
+    StatusLabel.Text = "Status: Teleporting to Raid..."
+    pcall(function()
+        local playerGui  = safeFindChild(Player, "PlayerGui", true)
+        local travel     = playerGui and safeFindChild(playerGui, "Travel", true)
+        local frame      = travel and safeFindChild(travel, "_Frame")
+        local usage      = frame and safeFindChild(frame, "Usage")
+        local body       = usage and safeFindChild(usage, "BODY")
+        local useable    = body and safeFindChild(body, "Useable")
+        local interview  = useable and safeFindChild(useable, "Interview")
+        local lobby      = interview and safeFindChild(interview, "Lobby")
+        local regular    = lobby and safeFindChild(lobby, "Regular")
+        local teleportBtn = regular and safeFindChild(regular, "Teleport")
+        if teleportBtn then safeFireConnection(teleportBtn) end
+    end)
+    task.wait(0.5)
+    HumanoidRootPart.CFrame = CFrame.new(1243.2982177734375, 1066.597900390625, -1058.265869140625)
+    task.wait(1)
+    startRaidStep2()
+end
+
+startRaidStep2 = function()
+    local SelectMap, SelectMode
+    pcall(function()
+        local playerGui = safeFindChild(Player, "PlayerGui", true)
+        local raids     = playerGui and safeFindChild(playerGui, "Raids", true)
+        local frame     = raids and safeFindChild(raids, "_Frame")
+        local usage     = frame and safeFindChild(frame, "Usage")
+        local left      = usage and safeFindChild(usage, "Left")
+        local center    = usage and safeFindChild(usage, "Center")
+        SelectMap  = left and safeFindChild(left, "Scrolling")
+        SelectMode = center and safeFindChild(center, "DifficultScrolling")
+    end)
+
+    StatusLabel.Text = "Status: Selecting map..."
+    if SelectMap then
+        for _, mapData in pairs(Maps) do
+            if mapData.enabled then
+                for _, v in pairs(SelectMap:GetChildren()) do
+                    if v.Name == mapData.name then
+                        setSelectedObject(v)
+                        sendKeyEvent(true, Enum.KeyCode.Return)
+                        sendKeyEvent(false, Enum.KeyCode.Return)
+                        task.wait(0.1)
+                    end
+                end
+            end
+        end
+    end
+    task.wait(0.5)
+
+    StatusLabel.Text = "Status: Selecting difficulty..."
+    if SelectMode then
+        for _, modeData in pairs(Modes) do
+            if modeData.enabled then
+                for _, v in pairs(SelectMode:GetChildren()) do
+                    if v.Name == modeData.name then
+                        setSelectedObject(v)
+                        sendKeyEvent(true, Enum.KeyCode.Return)
+                        sendKeyEvent(false, Enum.KeyCode.Return)
+                        task.wait(0.1)
+                    end
+                end
+            end
+        end
+    end
+    task.wait(0.5)
+
+    StatusLabel.Text = "Status: Starting raid..."
+    local startBtn = Player.PlayerGui.Raids._Frame.Usage.Right.Start
+    setSelectedObject(startBtn)
+    sendKeyEvent(true, Enum.KeyCode.Return)
+    sendKeyEvent(false, Enum.KeyCode.Return)
+    task.wait(0.1)
+    setSelectedObject(nil)
+
+    if _G.autoTraitRollEnabled and selectedUnit then
+        TraitStatusLabel.Text = "Trait Status: Rolling..."
+        autoTraitRoll()
+    end
+    task.wait(5)
+    startRaidStep3()
+end
+
+startRaidStep3 = function()
+    StatusLabel.Text = "Status: Farming mobs..."
+    local worlds  = safeFindChild(workspace, "Worlds", true)
+    local targets = worlds and safeFindChild(worlds, "Targets", true)
+    local mob     = targets and safeFindChild(targets, "Clients", true)
+    if not mob then
+        StatusLabel.Text = "Status: Raid targets not found"
+        task.wait(1); runFarmSequence(); return
+    end
+
+    local noMobStart     = nil
+    local maxNoMobTime   = 35
+    local farmingComplete = false
+
+    while not farmingComplete and _G.raidActive do
+        local livingMobs = getLivingMobs(mob)
+        StatusLabel.Text = "Status: Living mobs: " .. #livingMobs
+        if #livingMobs > 0 then
+            noMobStart = nil
+            local hrp    = safeFindChild(Player.Character, "HumanoidRootPart", true)
+            local target = nil
+            if hrp then
+                for _, candidate in ipairs(livingMobs) do
+                    local mobHRP = candidate:FindFirstChild("HumanoidRootPart")
+                    if mobHRP and (hrp.Position - mobHRP.Position).Magnitude <= 1000 then
+                        target = candidate; break
+                    end
+                end
+            end
+            if target then
+                StatusLabel.Text = "Status: Farming: " .. target.Name
+                local mobHRP = target:FindFirstChild("HumanoidRootPart")
+                if hrp and mobHRP then
+                    pcall(function() tweenTo(hrp, mobHRP.CFrame + Vector3.new(6, 0, 0)) end)
+                    task.wait(0.1)
+                end
+            else
+                StatusLabel.Text = "Status: No mobs within 1000 stud"
+                task.wait(1)
+            end
+        else
+            if not noMobStart then noMobStart = tick() end
+            local elapsed = tick() - noMobStart
+            StatusLabel.Text = string.format("Status: No mobs, retry %.1f/%d", elapsed, maxNoMobTime)
+            task.wait(0.5)
+            if elapsed >= maxNoMobTime then
+                farmingComplete = true
+                StatusLabel.Text = "Status: Farming complete"
+            end
+        end
+    end
+
+    collectRaidRewards()
+    startRaidStep4()
+end
+
+startRaidStep4 = function()
+    runFarmSequence()
+end
+
+-- ============================================================
+-- TOGGLE CONNECTIONS
+-- ============================================================
+StartButton.MouseButton1Click:Connect(function()
+    if not _G.raidActive then
+        local selectedMap, selectedMode
+        for _, map  in pairs(Maps)  do if map.enabled  then selectedMap  = map.name  break end end
+        for _, mode in pairs(Modes) do if mode.enabled then selectedMode = mode.name break end end
+        if not selectedMap  then StatusLabel.Text = "Status: Please select a map!"       return end
+        if not selectedMode then StatusLabel.Text = "Status: Please select a difficulty!" return end
+
+        local RS = ReplicatedStorage
+        RS:WaitForChild("Remotes"):WaitForChild("Systems"):WaitForChild("RaidsEvent"):FireServer(selectedMap, selectedMode)
+        RS:WaitForChild("Remotes"):WaitForChild("Misc"):WaitForChild("Parties"):FireServer("Disabled")
+
+        _G.raidActive = true
+        StartButton.Text             = "STOP RAID"
+        StartButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+        task.spawn(runFarmSequence)
+    else
+        _G.raidActive = false
+        StatusLabel.Text             = "Status: Stopping..."
+        StartButton.Text             = "START RAID"
+        StartButton.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+    end
+end)
+
+TraitRollToggle.MouseButton1Click:Connect(function()
+    _G.autoTraitRollEnabled = not _G.autoTraitRollEnabled
+    if _G.autoTraitRollEnabled then
+        TraitRollToggle.Text             = "ON"
+        TraitRollToggle.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+    else
+        TraitRollToggle.Text             = "OFF"
+        TraitRollToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+        TraitStatusLabel.Text            = "Trait Status: Idle"
+    end
+end)
+
+IgrisModeToggle.MouseButton1Click:Connect(function()
+    igrisEnabled = not igrisEnabled
+    if igrisEnabled then
+        IgrisModeToggle.Text             = "ON"
+        IgrisModeToggle.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+        StatusLabel.Text = "Status: Igris mode enabled..."
+        task.spawn(function() task.wait(0.5) igrisRaidLoop() end)
+    else
+        IgrisModeToggle.Text             = "OFF"
+        IgrisModeToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+        StatusLabel.Text = "Status: Idle"
+        if igrisChildConn then disconnectConn(igrisChildConn) igrisChildConn = nil end
+    end
+end)
+
+Boss10MToggle.MouseButton1Click:Connect(function()
+    autoBoss10MEnabled = not autoBoss10MEnabled
+    if autoBoss10MEnabled then
+        Boss10MToggle.Text             = "ON"
+        Boss10MToggle.BackgroundColor3 = Color3.fromRGB(255, 50, 100)
+        setupBoss10MHandler()
+    else
+        Boss10MToggle.Text             = "OFF"
+        Boss10MToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+        StatusLabel.Text = "Status: Idle"
+        disconnectTableConns(boss10MChildConns)
+    end
+end)
+
+RiftBossToggle.MouseButton1Click:Connect(function()
+    riftBossEnabled = not riftBossEnabled
+    if riftBossEnabled then
+        RiftBossToggle.Text             = "ON"
+        RiftBossToggle.BackgroundColor3 = Color3.fromRGB(255, 50, 50)
+        task.spawn(function()
+            local ok = teleportToReaperSociety()
+            if not ok then
+                riftBossEnabled                 = false
+                RiftBossToggle.Text             = "OFF"
+                RiftBossToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+                return
+            end
+            task.wait(1)
+            startRiftWatcher()
+            farmReaperBossWhileWaiting()
+        end)
+    else
+        RiftBossToggle.Text             = "OFF"
+        RiftBossToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+        stopRiftWatcher()
+        riftInProgress         = false
+        currentFarmInterrupted = false
+        disconnectTableConns(riftBossChildConns)
+    end
+end)
+
+DevilFruitToggle.MouseButton1Click:Connect(function()
+    devilFruitEnabled = not devilFruitEnabled
+    if devilFruitEnabled then
+        DevilFruitToggle.Text             = "ON"
+        DevilFruitToggle.BackgroundColor3 = Color3.fromRGB(255, 100, 255)
+        StatusLabel.Text = "Status: Devil Fruit Farm enabled..."
+        task.spawn(devilFruitFarmLoop)
+    else
+        DevilFruitToggle.Text             = "OFF"
+        DevilFruitToggle.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+        StatusLabel.Text = "Status: Idle"
+        disconnectTableConns(devilFruitChildConns)
+        local summoners = workspace:FindFirstChild("Summoners")
+        if summoners and _G.colosseumBackup then
+            for _, cloneObj in ipairs(_G.colosseumBackup) do
+                if cloneObj and not summoners:FindFirstChild("Colosseum Kingdom") then
+                    cloneObj.Parent = summoners
+                end
+            end
+        end
+        _G.colosseumBackup = nil
+    end
+end)
+
+-- Minimize / Close
+local isMinimized = false
+MinimizeBtn.MouseButton1Click:Connect(function()
+    isMinimized = not isMinimized
+    if isMinimized then
+        ContentFrame.Visible = false
+        MinimizeBtn.Text     = "+"
+        MainFrame.Size       = UDim2.new(0, 400, 0, 40)
+    else
+        ContentFrame.Visible = true
+        MinimizeBtn.Text     = "-"
+        MainFrame.Size       = UDim2.new(0, 400, 0, 480)
+    end
+end)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    _G.raidActive = false
+    ScreenGui:Destroy()
+end)
